@@ -1,0 +1,15 @@
+[package]
+name = "sequential"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+futures = "0.3.30"
+tokio = { version = "1.35.1", features = ["rt", "macros", "rt-multi-thread", "sync"] }
+tokio-stream = "0.1.14"
+sequential-macros = { version = "0.1.0", path = "sequential-macros" }
+
+[workspace]
+members=["sequential-macros"]
