@@ -39,7 +39,7 @@ pub fn actor(u: proc_macro::TokenStream) -> proc_macro::TokenStream {
     });
     let r = quote::quote! {
         #[derive(Clone)]
-        #vis struct #handle_type #impl_generics(::tokio::sync::mpsc::UnboundedSender<#msg_type #type_generics>) #where_clause;
+        #vis struct #handle_type #impl_generics(::sequential::tokio::sync::mpsc::UnboundedSender<#msg_type #type_generics>) #where_clause;
         const _: () = {
             #(#before_struct)*
             #struct_
