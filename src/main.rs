@@ -6,7 +6,8 @@ actor! {
         x: T,
     }
     impl<T: Send + Sync + Copy + Default + std::ops::AddAssign + std::ops::SubAssign> Accountant<T> {
-        fn new(x: T) -> Self {
+        fn new(x: T, y: usize) -> Self {
+            let _ = y;
             Self {
                 x,
             }
@@ -41,7 +42,7 @@ actor! {
 #[tokio::main]
 async fn main() {
     use tokio_stream::StreamExt;
-    let acct = AccountantHandle::new(7);
+    let acct = AccountantHandle::new(7, 8);
     let _seq1 = acct.count_to_ten_immediately().await;
     println!("{}", acct.increase(12).await);
     let mut seq = acct.count_to_ten_on_demand().await;

@@ -2,6 +2,7 @@
 pub fn actor(u: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let Actor {
         before_struct,
+        docs,
         struct_,
         before_impl,
         mut impl_,
@@ -21,42 +22,33 @@ pub fn actor(u: proc_macro::TokenStream) -> proc_macro::TokenStream {
         &format!("{}Message", actor_type),
         proc_macro2::Span::mixed_site(),
     );
-    let mut new_args = vec![];
-    let (msg_enum, msg_to_action, method_to_msg) =
-        match process_actions(&actor, &msg_type, &mut impl_, &mut new_args) {
+    let (msg_enum, msg_to_action, method_to_msg, new_sig, new_arg_names, new_brace_span) =
+        match process_actions(&actor, &msg_type, &mut impl_) {
             Ok(ok) => ok,
             Err(e) => return e.to_compile_error().into(),
         };
-    let new_arg_names = new_args.iter().filter_map(|a| {
-        if let syn::FnArg::Typed(syn::PatType { pat: a, .. }) = a {
-            let syn::Pat::Ident(a) = &**a else {
-                unreachable!()
-            };
-            Some(a)
-        } else {
-            None
-        }
-    });
+    let new = NewConstructor {
+        tx: &tx,
+        rx: &rx,
+        actor: &actor,
+        msg_type: &msg_type,
+        actor_type: &actor_type,
+        type_generics: &type_generics,
+        sig: &new_sig,
+        new_arg_names: &new_arg_names,
+        msg_to_action: &msg_to_action,
+        brace: syn::token::Brace(new_brace_span),
+    };
     let r = quote::quote! {
         #[derive(Clone)]
+        #(#docs)*
         #vis struct #handle_type #impl_generics(::sequential::tokio::sync::mpsc::UnboundedSender<#msg_type #type_generics>) #where_clause;
         const _: () = {
             #(#before_struct)*
             #struct_
             #(#before_impl)*
             #impl_ impl #impl_generics #handle_type #type_generics {
-                fn new(#(#new_args)*) -> Self {
-                    let (#tx, mut #rx) = ::sequential::tokio::sync::mpsc::unbounded_channel::<#msg_type #type_generics>();
-                            ::sequential::tokio::spawn(async move {
-                                let mut #actor = <#actor_type #type_generics>::new(#(#new_arg_names)*);
-                                while let Some(msg) = #rx.recv().await {
-                                    match msg {
-                                        #msg_to_action
-                                    }
-                                }
-                            });
-                    Self(#tx)
-                }
+                #new
                 #method_to_msg
             }
             #(#at_end)*
@@ -66,12 +58,46 @@ pub fn actor(u: proc_macro::TokenStream) -> proc_macro::TokenStream {
             #msg_enum
         }
     };
-    //println!("{r}");
     r.into()
+}
+
+struct NewConstructor<'a> {
+    tx: &'a syn::Ident,
+    rx: &'a syn::Ident,
+    actor: &'a syn::Ident,
+    msg_type: &'a syn::Ident,
+    actor_type: &'a syn::Ident,
+    type_generics: &'a syn::TypeGenerics<'a>,
+    new_arg_names: &'a [syn::Ident],
+    msg_to_action: &'a proc_macro2::TokenStream,
+    sig: &'a proc_macro2::TokenStream,
+    brace: syn::token::Brace,
+}
+impl<'a> quote::ToTokens for NewConstructor<'a> {
+    fn to_tokens(&self, toks: &mut proc_macro2::TokenStream) {
+        self.sig.to_tokens(toks);
+        self.brace.surround(toks, |toks| {
+            let Self { tx, rx, msg_type, actor, actor_type, type_generics, new_arg_names, msg_to_action, ..} = self;
+            let body = quote::quote! {
+                let (#tx, mut #rx) = ::sequential::tokio::sync::mpsc::unbounded_channel::<#msg_type #type_generics>();
+                ::sequential::tokio::spawn(async move {
+                    let mut #actor = <#actor_type #type_generics>::new(#(#new_arg_names),*);
+                    while let Some(msg) = #rx.recv().await {
+                        match msg {
+                            #msg_to_action
+                        }
+                    }
+                });
+                Self(#tx)
+            };
+            body.to_tokens(toks);
+        })
+    }
 }
 
 struct Actor {
     before_struct: Vec<syn::Item>,
+    docs: Vec<syn::Attribute>,
     struct_: syn::ItemStruct,
     before_impl: Vec<syn::Item>,
     impl_: syn::ItemImpl,
@@ -80,6 +106,7 @@ struct Actor {
 impl syn::parse::Parse for Actor {
     fn parse(input: &syn::parse::ParseBuffer) -> Result<Self, syn::Error> {
         let mut before_struct = vec![];
+        let mut docs = vec![];
         let mut struct_ = None;
         let mut before_impl = vec![];
         let mut impl_ = None;
@@ -98,12 +125,22 @@ impl syn::parse::Parse for Actor {
                 item => at_end.push(item),
             }
         }
+        let mut struct_ = struct_.ok_or(syn::Error::new(
+            input.span(),
+            "No `struct` definition in #[actor] module.",
+        ))?;
+        let mut i = 0;
+        while i < struct_.attrs.len() {
+            if struct_.attrs[i].path().is_ident("doc") {
+                docs.push(struct_.attrs.remove(i));
+            } else {
+                i += 1;
+            }
+        }
         Ok(Self {
             before_struct,
-            struct_: struct_.ok_or(syn::Error::new(
-                input.span(),
-                "No `struct` definition in #[actor] module.",
-            ))?,
+            docs,
+            struct_,
             before_impl,
             impl_: impl_.ok_or(syn::Error::new(
                 input.span(),
@@ -114,22 +151,31 @@ impl syn::parse::Parse for Actor {
     }
 }
 
-fn process_actions(
+fn process_actions<'a>(
     actor: &syn::Ident,
     msg_type: &syn::Ident,
-    impl_: &mut syn::ItemImpl,
-    new_args: &mut Vec<syn::FnArg>,
+    impl_: &'a mut syn::ItemImpl,
 ) -> Result<
     (
         proc_macro2::TokenStream,
         proc_macro2::TokenStream,
         proc_macro2::TokenStream,
+        proc_macro2::TokenStream,
+        Vec<syn::Ident>,
+        proc_macro2::extra::DelimSpan,
     ),
     syn::Error,
 > {
     let mut messages = vec![];
-    for item in &mut impl_.items {
-        if let syn::ImplItem::Fn(syn::ImplItemFn { attrs, sig, .. }) = item {
+    let mut new_sig = proc_macro2::TokenStream::new();
+    let mut new_arg_names = vec![];
+    let mut new_span = None;
+    for item in impl_.items.iter_mut() {
+        if let syn::ImplItem::Fn(syn::ImplItemFn {
+            attrs, sig, block, ..
+        }) = item
+        {
+            let brace_span = block.brace_token.span;
             if let Some((idx, _)) = attrs
                 .iter()
                 .enumerate()
@@ -235,7 +281,7 @@ fn process_actions(
                         } else {
                             None
                         };
-                        messages.push((returns, item.vis.clone(), item.sig.clone()));
+                        messages.push((returns, item.vis.clone(), item.sig.clone(), brace_span));
                     }
                     MethodType::Generator => {
                         let returns = if let syn::ReturnType::Type(_, t) = &item.sig.output {
@@ -291,7 +337,7 @@ fn process_actions(
                         } else {
                             None
                         };
-                        messages.push((returns, item.vis.clone(), item.sig.clone()));
+                        messages.push((returns, item.vis.clone(), item.sig.clone(), brace_span));
                     }
                     MethodType::Single => {
                         let returns = if let syn::ReturnType::Type(_, t) = &item.sig.output {
@@ -323,7 +369,7 @@ fn process_actions(
                         } else {
                             None
                         };
-                        messages.push((returns, item.vis.clone(), item.sig.clone()));
+                        messages.push((returns, item.vis.clone(), item.sig.clone(), brace_span));
                     }
                 }
             } else if sig.ident == "new" {
@@ -333,9 +379,13 @@ fn process_actions(
                         "associated function `new` must be a constructor.",
                     ));
                 }
+
+                use quote::ToTokens;
                 for input in &sig.inputs {
                     if let syn::FnArg::Typed(syn::PatType { pat, .. }) = input {
-                        if !matches!(&**pat, syn::Pat::Ident(_)) {
+                        if let syn::Pat::Ident(p) = &**pat {
+                            new_arg_names.push(p.ident.clone());
+                        } else {
                             return Err(syn::Error::new_spanned(
                                 pat,
                                 "Pattern arguments are not allowed on associated function `new`.",
@@ -343,13 +393,30 @@ fn process_actions(
                         }
                     }
                 }
-                new_args.extend(sig.inputs.iter().cloned());
+                for attr in attrs {
+                    attr.to_tokens(&mut new_sig);
+                }
+                sig.fn_token.to_tokens(&mut new_sig);
+                sig.ident.to_tokens(&mut new_sig);
+                sig.paren_token.surround(&mut new_sig, |new_sig| {
+                    for input in sig.inputs.pairs() {
+                        input.value().to_tokens(new_sig);
+                        input.punct().to_tokens(new_sig)
+                    }
+                });
+                if let syn::ReturnType::Type(r, _) = &sig.output {
+                    r.to_tokens(&mut new_sig);
+                } else {
+                    <syn::Token![->]>::default().to_tokens(&mut new_sig);
+                }
+                <syn::Token![Self]>::default().to_tokens(&mut new_sig);
+                new_span = Some(block.brace_token.span);
             }
         }
     }
     let msg_enum = messages
         .iter()
-        .map(|(_, _, syn::Signature { ident, inputs, .. })| {
+        .map(|(_, _, syn::Signature { ident, inputs, .. }, _)| {
             let types = inputs.iter().filter_map(|i| {
                 if let syn::FnArg::Typed(syn::PatType { ty, .. }) = i {
                     Some(ty)
@@ -361,7 +428,7 @@ fn process_actions(
         });
     let msg_to_action = messages
         .iter()
-        .map(|(_, _, syn::Signature { ident, inputs, .. })| {
+        .map(|(_, _, syn::Signature { ident, inputs, .. }, _)| {
             let input_names = inputs.iter().filter_map(|a| {
                 if let syn::FnArg::Typed(syn::PatType { pat: a, .. }) = a {
                     let syn::Pat::Ident(a) = &**a else {
@@ -388,6 +455,7 @@ fn process_actions(
                 fn_token,
                 ..
             },
+            brace_span,
         )| {
             let mut inputs = inputs.clone();
             let (receiver, output, channel, return_) = if let Some((r, o, c, r_)) = &out {
@@ -414,18 +482,30 @@ fn process_actions(
             let channel_arg = out.as_ref().map(|_| {
                 quote::quote! {tx}
             });
-            quote::quote! {
-                #vis #asyncness #fn_token #ident(#inputs) #output {
+            let brace = syn::token::Brace(*brace_span);
+            let mut r = quote::quote! {
+            #vis #asyncness #fn_token #ident(#inputs) #output};
+            brace.surround(&mut r, |r| {
+                use quote::ToTokens;
+                quote::quote! {
                     #channel
                     let _ = self.0.send(#msg_type::#ident(#(#input_names,)*#channel_arg));
                     #return_
                 }
-            }
+                .to_tokens(r)
+            });
+            r
         },
     );
     Ok((
         quote::quote! {#(#msg_enum),*},
         quote::quote! {#(#msg_to_action),*},
         quote::quote! {#(#method_to_msg)*},
+        new_sig,
+        new_arg_names,
+        new_span.ok_or(syn::Error::new_spanned(
+            &impl_,
+            "Missing `new()` constructor.",
+        ))?,
     ))
 }
